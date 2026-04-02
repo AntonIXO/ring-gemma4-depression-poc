@@ -1,6 +1,8 @@
 """Full multimodal model: PPG encoder + projector + LLM backbone + classifier."""
 
 import math
+import os
+
 import torch
 import torch.nn as nn
 
@@ -62,6 +64,7 @@ class MockLLM(nn.Module):
 
     def forward(self, inputs_embeds: torch.Tensor | None = None,
                 input_ids: torch.Tensor | None = None,
+                attention_mask: torch.Tensor | None = None,
                 **kwargs):
         if inputs_embeds is None:
             if input_ids is None:
@@ -70,7 +73,14 @@ class MockLLM(nn.Module):
 
         seq_len = inputs_embeds.size(1)
         x = inputs_embeds + self.pe[:, :seq_len, :]
-        hidden = self.transformer(x)
+
+        # Convert attention_mask (1=attend, 0=ignore) to src_key_padding_mask
+        # (True=ignore for nn.TransformerEncoder)
+        pad_mask = None
+        if attention_mask is not None:
+            pad_mask = (attention_mask == 0)  # True where padding
+
+        hidden = self.transformer(x, src_key_padding_mask=pad_mask)
 
         # Return object with .last_hidden_state
         class _Out:
@@ -135,9 +145,10 @@ class RingGemmaModel(nn.Module):
         self.llm_dim = llm_dim
         self.use_real_llm = use_real_llm
 
-        # Frozen PPG encoder
-        self.encoder = get_encoder(use_papagei=False)
-        self.encoder.output_dim = encoder_dim
+        # Frozen PPG encoder — try PaPaGei first, fall back to ResNet-1D
+        self.encoder = get_encoder(use_papagei=True)
+        # Read actual encoder output dim; don't blindly overwrite
+        encoder_dim = getattr(self.encoder, 'output_dim', encoder_dim)
 
         # Trainable projector
         self.projector = SensorProjector(encoder_dim=encoder_dim,
@@ -151,14 +162,21 @@ class RingGemmaModel(nn.Module):
             self.llm = MockLLM(hidden_dim=llm_dim)
             self.tokenizer = MockTokenizer()
 
-        # Classification head on first token's hidden state
+        # Classification head on last (causal) token's hidden state
         self.classifier = nn.Linear(llm_dim, 2)
 
     def _load_real_llm(self, device: str):
         """Attempt to load a real Gemma model with quantization on GPU."""
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
-        model_name = "google/gemma-3-1b-it"
+        model_name = os.environ.get("GEMMA_MODEL", "google/gemma-4-it")
+        # Fall back to gemma-3-1b-it if Gemma 4 is not yet on HuggingFace
+        try:
+            from huggingface_hub import model_info
+            model_info(model_name)
+        except Exception:
+            model_name = "google/gemma-3-1b-it"
+            print(f"[WARN] Gemma 4 not available, falling back to {model_name}")
 
         tokenizer = AutoTokenizer.from_pretrained(model_name)
         if tokenizer.pad_token is None:
@@ -186,7 +204,7 @@ class RingGemmaModel(nn.Module):
             r=8,
             lora_alpha=16,
             lora_dropout=0.05,
-            target_modules=["q_proj", "v_proj"],
+            target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
             task_type="CAUSAL_LM",
         )
         model = get_peft_model(model, lora_config)
@@ -246,16 +264,26 @@ class RingGemmaModel(nn.Module):
         # 4. Get text embeddings
         text_embeds = self.llm.embed_tokens(input_ids)  # (B, T, llm_dim)
 
-        # 5. Concatenate [sensor_tokens, text_embeds]
+        # 5. Build attention mask: sensor tokens always attend, text uses tokenizer mask
+        sensor_mask = torch.ones(batch_size, self.projector.n_tokens,
+                                 device=device, dtype=torch.long)
+        text_mask = tok.attention_mask.to(device)
+        attention_mask = torch.cat([sensor_mask, text_mask], dim=1)  # (B, S)
+
+        # 6. Concatenate [sensor_tokens, text_embeds]
         combined = torch.cat([sensor_tokens, text_embeds], dim=1)
 
-        # 6. Forward through LLM
-        out = self.llm(inputs_embeds=combined)
+        # 7. Forward through LLM with attention mask
+        out = self.llm(inputs_embeds=combined, attention_mask=attention_mask)
         hidden = out.last_hidden_state  # (B, S, llm_dim)
 
-        # 7. Classification on first token
-        first_token = hidden[:, 0, :]
-        logits = self.classifier(first_token)  # (B, 2)
+        # 8. Classification on LAST non-padded token
+        #    Causal model: last token attends to ALL previous tokens.
+        #    Position 0 under causal masking sees NOTHING — using it would
+        #    nullify multimodal fusion entirely.
+        seq_lengths = attention_mask.sum(dim=1) - 1  # index of last valid token
+        last_token = hidden[torch.arange(batch_size, device=device), seq_lengths]
+        logits = self.classifier(last_token)  # (B, 2)
 
         result = {"logits": logits}
 

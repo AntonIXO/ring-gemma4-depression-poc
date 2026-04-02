@@ -82,6 +82,29 @@ Traditional wearable health pipelines extract hand-crafted feature vectors (e.g.
 
 This PoC implements Phases 1 and 3, demonstrating that a frozen PPG encoder + trainable projector can align sensor semantics with a language model's representation space.
 
+## Architecture Fixes Applied
+
+### Causal Last-Token Classification
+Decoder-only transformers (Gemma, GPT) use causal attention: token at position 0 can only see itself, while the last token attends to the entire sequence. The classification head now reads the last non-padded hidden state, ensuring full multimodal fusion between sensor tokens and EHR text.
+
+### Attention Mask for Padded Sequences
+When PPG sensor tokens are concatenated with variable-length tokenized EHR text, an explicit attention mask is constructed and passed to the LLM backbone. Sensor tokens always attend (mask=1); text tokens follow the tokenizer's padding mask. This prevents padded positions from corrupting the classifier input.
+
+### Gemma 4 Upgrade Path
+The real-LLM loader now defaults to `google/gemma-4-it` and falls back to `google/gemma-3-1b-it` if Gemma 4 is not yet available on HuggingFace. Override via `GEMMA_MODEL` environment variable. LoRA targets all four attention projections (`q_proj`, `k_proj`, `v_proj`, `o_proj`).
+
+### WESAD Dataset Support
+Real physiological data from the [WESAD dataset](https://ubicomp.eti.uni-siegen.de/home/datasets/icmi18/) can now be loaded directly:
+
+```bash
+# 1. Download WESAD from https://ubicomp.eti.uni-siegen.de/home/datasets/icmi18/
+# 2. Extract to data/raw/WESAD/
+# 3. Train:
+python src/train.py --wesad_path data/raw/WESAD --cpu --epochs_stage1 5 --epochs_stage2 10
+```
+
+The loader reads wrist BVP (PPG at 64 Hz) from each subject's pickle file and uses PANAS negative-affect scores as binary labels (above median = distressed).
+
 ## Setup
 
 ```bash
@@ -117,10 +140,18 @@ python src/evaluate.py --synthetic --cpu
 # → results/evaluation_report.md
 ```
 
+### Train with WESAD data
+
+```bash
+python src/train.py --wesad_path data/raw/WESAD --cpu --epochs_stage1 5 --epochs_stage2 10
+```
+
 ### Train with real Gemma on GPU
 
 ```bash
 python src/train.py --synthetic --use_real_llm --epochs_stage1 5 --epochs_stage2 10
+# Or override the model:
+GEMMA_MODEL=google/gemma-4-e4b-it python src/train.py --synthetic --use_real_llm
 ```
 
 ### Run the demo notebook

@@ -103,6 +103,8 @@ def main():
     parser = argparse.ArgumentParser(description="Train RingGemma model")
     parser.add_argument("--synthetic", action="store_true",
                         help="Use synthetic data")
+    parser.add_argument("--wesad_path", type=str, default=None,
+                        help="Path to WESAD dataset directory (overrides --synthetic)")
     parser.add_argument("--cpu", action="store_true",
                         help="Force CPU mode")
     parser.add_argument("--use_real_llm", action="store_true",
@@ -122,12 +124,15 @@ def main():
     print(f"Device: {device}")
 
     # --- Data ---
-    if args.synthetic:
+    if args.wesad_path is not None:
+        print(f"Loading WESAD dataset from {args.wesad_path}...")
+        dataset = DepressionDataset.from_wesad(args.wesad_path)
+    elif args.synthetic:
         print(f"Generating synthetic dataset ({args.n_samples} samples)...")
         dataset = DepressionDataset.create_synthetic(args.n_samples)
     else:
         raise NotImplementedError(
-            "Real data loading not implemented. Use --synthetic."
+            "Provide --wesad_path or --synthetic."
         )
 
     # 80/20 train/val split
