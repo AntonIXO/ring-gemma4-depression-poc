@@ -1,0 +1,12 @@
+torch>=2.2.0
+transformers>=4.44.0
+peft>=0.10.0
+bitsandbytes>=0.43.0
+scipy
+numpy
+pandas
+scikit-learn
+matplotlib
+jupyter
+nbformat
+accelerate
