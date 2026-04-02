@@ -18,21 +18,21 @@ from src.model import RingGemmaModel
 
 
 def collate_fn(batch: list[dict]) -> dict:
-    """Custom collate: pad PPG segments to the max count in the batch."""
-    max_seg = max(item["ppg_segments"].size(0) for item in batch)
-    seg_dim = batch[0]["ppg_segments"].size(-1)
+    """Custom collate: pad health time-series to the max T in the batch."""
+    max_t = max(item["health_ts"].size(0) for item in batch)
+    n_feat = batch[0]["health_ts"].size(-1)
 
-    padded_segs = []
+    padded_ts = []
     for item in batch:
-        segs = item["ppg_segments"]  # (N_i, 1, 1250)
-        n = segs.size(0)
-        if n < max_seg:
-            pad = torch.zeros(max_seg - n, 1, seg_dim)
-            segs = torch.cat([segs, pad], dim=0)
-        padded_segs.append(segs)
+        ts = item["health_ts"]  # (T_i, F)
+        t = ts.size(0)
+        if t < max_t:
+            pad = torch.zeros(max_t - t, n_feat)
+            ts = torch.cat([ts, pad], dim=0)
+        padded_ts.append(ts)
 
     return {
-        "ppg_segments": torch.stack(padded_segs),      # (B, max_seg, 1, 1250)
+        "health_ts": torch.stack(padded_ts),  # (B, max_T, F)
         "ehr_text": [item["ehr_text"] for item in batch],
         "label": torch.tensor([item["label"] for item in batch], dtype=torch.long),
     }
@@ -46,12 +46,12 @@ def train_one_epoch(model, loader, optimizer, device, max_norm=1.0):
     all_labels = []
 
     for batch in loader:
-        ppg = batch["ppg_segments"].to(device)
+        ts = batch["health_ts"].to(device)
         texts = batch["ehr_text"]
         labels = batch["label"].to(device)
 
         optimizer.zero_grad()
-        out = model(ppg, texts, labels=labels)
+        out = model(ts, texts, labels=labels)
         loss = out["loss"]
         loss.backward()
 
@@ -82,11 +82,11 @@ def evaluate(model, loader, device):
     all_labels = []
 
     for batch in loader:
-        ppg = batch["ppg_segments"].to(device)
+        ts = batch["health_ts"].to(device)
         texts = batch["ehr_text"]
         labels = batch["label"].to(device)
 
-        out = model(ppg, texts, labels=labels)
+        out = model(ts, texts, labels=labels)
         total_loss += out["loss"].item() * labels.size(0)
         preds = out["logits"].argmax(dim=-1).cpu().numpy()
         all_preds.extend(preds.tolist())
@@ -116,6 +116,10 @@ def main():
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--n_samples", type=int, default=200,
                         help="Number of synthetic samples")
+    parser.add_argument("--time_steps", type=int, default=14,
+                        help="Time steps per sample (synthetic data)")
+    parser.add_argument("--num_features", type=int, default=10,
+                        help="Number of health-metric features")
     parser.add_argument("--lr_stage1", type=float, default=1e-3)
     parser.add_argument("--lr_stage2", type=float, default=2e-5)
     args = parser.parse_args()
@@ -127,9 +131,17 @@ def main():
     if args.wesad_path is not None:
         print(f"Loading WESAD dataset from {args.wesad_path}...")
         dataset = DepressionDataset.from_wesad(args.wesad_path)
+        # Infer n_features from first sample
+        n_features = dataset.health_ts_list[0].size(-1)
     elif args.synthetic:
-        print(f"Generating synthetic dataset ({args.n_samples} samples)...")
-        dataset = DepressionDataset.create_synthetic(args.n_samples)
+        print(f"Generating synthetic dataset ({args.n_samples} samples, "
+              f"T={args.time_steps}, F={args.num_features})...")
+        dataset = DepressionDataset.create_synthetic(
+            args.n_samples,
+            time_steps=args.time_steps,
+            n_features=args.num_features,
+        )
+        n_features = args.num_features
     else:
         raise NotImplementedError(
             "Provide --wesad_path or --synthetic."
@@ -150,6 +162,7 @@ def main():
 
     # --- Model ---
     model = RingGemmaModel(
+        n_features=n_features,
         use_real_llm=args.use_real_llm,
         device=device,
     )

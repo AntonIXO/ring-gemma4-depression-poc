@@ -1,142 +1,163 @@
-"""Sensor encoder: PaPaGei wrapper with ResNet-1D fallback."""
+"""MacroTrendEncoder: temporal encoder for pre-aggregated health metrics.
+
+Design rationale
+----------------
+Smart rings (Oura, RingConn, Ultrahuman) expose pre-computed half-day or
+daily aggregates, NOT raw PPG waveforms. The input is a tabular time-series
+matrix  X ∈ R^{T×F}  where T ≈ 7-28 time steps and F ≈ 7-15 features
+(heart_rate_mean, hrv_rmssd, hrv_sdnn, spo2_mean, skin_temp_delta, steps,
+respiratory_rate, …).
+
+Architecture choice: **lightweight Transformer encoder**.
+
+Why Transformer over 1D-CNN for this data:
+  1. T is small (≤28), so O(T²) self-attention is trivial.
+  2. Features are *heterogeneous tabular metrics* with different scales and
+     semantics — a learned Linear projection handles this naturally, while
+     convolutions assume spatial/temporal locality in the feature dimension.
+  3. Self-attention across time steps captures non-local dependencies like
+     "HRV dropped 3 days ago AND temperature rose today → onset pattern".
+  4. Per-step hidden states give the downstream SensorProjector a meaningful
+     *sequence* to pool over (T → n_tokens), preserving temporal resolution.
+
+This aligns with optiHealth 2.0 Ch.15: "Custom Temporal Encoder (a 1D-CNN
+or lightweight Transformer) parses this matrix to extract macro-dynamics."
+
+The encoder is frozen after initialisation, consistent with the rest of the
+pipeline (frozen encoder → trainable projector → frozen+LoRA LLM).
+"""
+
+import math
 
 import torch
 import torch.nn as nn
 
 
-class ResidualBlock1D(nn.Module):
-    """Single residual block for 1-D convolutions."""
+class MacroTrendEncoder(nn.Module):
+    """Transformer encoder for aggregated wearable health metrics.
 
-    def __init__(self, in_channels: int, out_channels: int, kernel_size: int = 3,
-                 stride: int = 1):
-        super().__init__()
-        padding = kernel_size // 2
-        self.conv1 = nn.Conv1d(in_channels, out_channels, kernel_size,
-                               stride=stride, padding=padding, bias=False)
-        self.bn1 = nn.BatchNorm1d(out_channels)
-        self.relu = nn.ReLU(inplace=True)
-        self.conv2 = nn.Conv1d(out_channels, out_channels, kernel_size,
-                               stride=1, padding=padding, bias=False)
-        self.bn2 = nn.BatchNorm1d(out_channels)
+    Input:  (batch, T, n_features)  — tabular time-series
+    Output: (batch, T, output_dim)  — per-step embeddings
 
-        # Skip connection (identity or projection)
-        if in_channels != out_channels or stride != 1:
-            self.skip = nn.Sequential(
-                nn.Conv1d(in_channels, out_channels, 1, stride=stride, bias=False),
-                nn.BatchNorm1d(out_channels),
-            )
-        else:
-            self.skip = nn.Identity()
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        identity = self.skip(x)
-        out = self.relu(self.bn1(self.conv1(x)))
-        out = self.bn2(self.conv2(out))
-        return self.relu(out + identity)
-
-
-class ResNet1D(nn.Module):
-    """18-block ResNet-1D encoder for 1-channel PPG signals.
+    The downstream SensorProjector pools T → n_tokens and projects
+    output_dim → llm_dim, so we preserve the full temporal sequence here.
 
     Architecture:
-        - Input: (batch, 1, 1250)
-        - Initial conv: 1 → 64 channels
-        - 18 residual blocks, base_filters=64 doubling every 4 blocks
-          (blocks 0-3: 64, 4-7: 128, 8-11: 256, 12-17: 512)
-        - Global average pooling
-        - Output: (batch, 512)
+        Linear(n_features → d_model)   feature projection
+        + sinusoidal positional encoding
+        → N TransformerEncoder layers (d_model, nhead, ff)
+        → Linear(d_model → output_dim)  if d_model != output_dim
+
+    Parameters (with defaults):
+        n_features=10, d_model=256, nhead=4, n_layers=4, ff_mult=4,
+        output_dim=512, max_len=128, dropout=0.1
+        → ~2.7 M parameters.
     """
 
-    def __init__(self, input_channels: int = 1, base_filters: int = 64,
-                 n_blocks: int = 18, output_dim: int = 512):
+    def __init__(
+        self,
+        n_features: int = 10,
+        d_model: int = 256,
+        nhead: int = 4,
+        n_layers: int = 4,
+        ff_mult: int = 4,
+        output_dim: int = 512,
+        max_len: int = 128,
+        dropout: float = 0.1,
+    ):
         super().__init__()
         self.output_dim = output_dim
+        self.n_features = n_features
+        self.d_model = d_model
 
-        # Initial convolution
-        self.stem = nn.Sequential(
-            nn.Conv1d(input_channels, base_filters, kernel_size=7, stride=2,
-                      padding=3, bias=False),
-            nn.BatchNorm1d(base_filters),
-            nn.ReLU(inplace=True),
-            nn.MaxPool1d(kernel_size=3, stride=2, padding=1),
+        # Project heterogeneous features into d_model space
+        self.feature_proj = nn.Sequential(
+            nn.Linear(n_features, d_model),
+            nn.LayerNorm(d_model),
         )
 
-        # Build residual blocks
-        blocks = []
-        in_ch = base_filters
-        for i in range(n_blocks):
-            # Double channels every 4 blocks
-            group = i // 4
-            out_ch = min(base_filters * (2 ** group), output_dim)
-            stride = 2 if (i > 0 and i % 4 == 0) else 1
-            blocks.append(ResidualBlock1D(in_ch, out_ch, stride=stride))
-            in_ch = out_ch
+        # Sinusoidal positional encoding (not learned — keeps param count low)
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float32).unsqueeze(1)
+        div_term = torch.exp(
+            torch.arange(0, d_model, 2, dtype=torch.float32)
+            * (-math.log(10000.0) / d_model)
+        )
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        self.register_buffer("pe", pe.unsqueeze(0))  # (1, max_len, d_model)
 
-        self.blocks = nn.Sequential(*blocks)
-        self.gap = nn.AdaptiveAvgPool1d(1)
+        # Transformer encoder blocks
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=nhead,
+            dim_feedforward=d_model * ff_mult,
+            dropout=dropout,
+            batch_first=True,
+            norm_first=True,  # Pre-LN for better gradient flow
+        )
+        self.transformer = nn.TransformerEncoder(
+            encoder_layer, num_layers=n_layers
+        )
 
-        # Final projection to output_dim if last block channels differ
-        if in_ch != output_dim:
-            self.proj = nn.Linear(in_ch, output_dim)
+        # Output projection to match expected encoder_dim
+        if d_model != output_dim:
+            self.out_proj = nn.Linear(d_model, output_dim)
         else:
-            self.proj = nn.Identity()
+            self.out_proj = nn.Identity()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass.
+        """Encode a tabular time-series.
 
         Args:
-            x: (batch, 1, 1250) PPG segment tensor.
+            x: (batch, T, n_features) — health metric values per time step.
+               NaN values should be replaced with 0.0 before calling this
+               (see preprocessing.preprocess_tabular).
 
         Returns:
-            (batch, 512) embedding.
+            (batch, T, output_dim) — per-step embeddings.
         """
-        out = self.stem(x)
-        out = self.blocks(out)
-        out = self.gap(out).squeeze(-1)
-        out = self.proj(out)
-        return out
+        T = x.size(1)
+
+        # Feature projection + positional encoding
+        h = self.feature_proj(x)          # (batch, T, d_model)
+        h = h + self.pe[:, :T, :]         # add positional encoding
+
+        # Self-attention across time steps
+        h = self.transformer(h)           # (batch, T, d_model)
+
+        # Project to output_dim
+        return self.out_proj(h)           # (batch, T, output_dim)
 
 
-def _try_load_papagei() -> nn.Module | None:
-    """Attempt to load the PaPaGei encoder from HuggingFace."""
-    try:
-        from papagei import PaPaGei  # type: ignore
-        model = PaPaGei.from_pretrained("nokia-bell-labs/papagei")
-        return model
-    except Exception:
-        pass
+def get_encoder(
+    n_features: int = 10,
+    d_model: int = 256,
+    n_layers: int = 4,
+    output_dim: int = 512,
+    **kwargs,
+) -> MacroTrendEncoder:
+    """Create and freeze a MacroTrendEncoder.
 
-    try:
-        from transformers import AutoModel
-        model = AutoModel.from_pretrained("nokia-bell-labs/papagei",
-                                          trust_remote_code=True)
-        return model
-    except Exception:
-        return None
-
-
-def get_encoder(use_papagei: bool = True) -> nn.Module:
-    """Return a PPG encoder.
-
-    Tries PaPaGei first (if *use_papagei* is True), then falls back to a
-    custom ResNet-1D.  All weights are frozen.
+    All weights are frozen after construction (consistent with the
+    PaPaGei/ResNet-1D convention in the original pipeline).
 
     Args:
-        use_papagei: Whether to attempt loading PaPaGei.
+        n_features: Number of input health-metric features.
+        d_model: Transformer hidden dimension.
+        n_layers: Number of transformer layers.
+        output_dim: Output embedding dimension.
 
     Returns:
-        Frozen nn.Module with .output_dim attribute (512).
+        Frozen MacroTrendEncoder with .output_dim attribute.
     """
-    encoder = None
-    if use_papagei:
-        encoder = _try_load_papagei()
-        if encoder is not None:
-            if not hasattr(encoder, "output_dim"):
-                encoder.output_dim = 512
-
-    if encoder is None:
-        encoder = ResNet1D(input_channels=1, base_filters=64, n_blocks=18,
-                           output_dim=512)
+    encoder = MacroTrendEncoder(
+        n_features=n_features,
+        d_model=d_model,
+        n_layers=n_layers,
+        output_dim=output_dim,
+        **kwargs,
+    )
 
     # Freeze all parameters
     for param in encoder.parameters():

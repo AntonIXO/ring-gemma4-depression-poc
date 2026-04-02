@@ -127,9 +127,10 @@ class MockTokenizer:
 # ---------------------------------------------------------------------------
 
 class RingGemmaModel(nn.Module):
-    """Multimodal model: PPG encoder → projector → LLM → classification head.
+    """Multimodal model: health encoder → projector → LLM → classification head.
 
     Args:
+        n_features: Number of input health-metric features per time step.
         encoder_dim: Encoder output dimension (default 512).
         llm_dim: LLM hidden dimension (default 2048).
         n_tokens: Number of virtual sensor tokens (default 16).
@@ -137,17 +138,17 @@ class RingGemmaModel(nn.Module):
         device: 'cpu' or 'cuda'.
     """
 
-    def __init__(self, encoder_dim: int = 512, llm_dim: int = 2048,
-                 n_tokens: int = 16, use_real_llm: bool = False,
-                 device: str = "cpu"):
+    def __init__(self, n_features: int = 10, encoder_dim: int = 512,
+                 llm_dim: int = 2048, n_tokens: int = 16,
+                 use_real_llm: bool = False, device: str = "cpu"):
         super().__init__()
         self.device_str = device
         self.llm_dim = llm_dim
         self.use_real_llm = use_real_llm
 
-        # Frozen PPG encoder — try PaPaGei first, fall back to ResNet-1D
-        self.encoder = get_encoder(use_papagei=True)
-        # Read actual encoder output dim; don't blindly overwrite
+        # Frozen MacroTrendEncoder for tabular health time-series
+        self.encoder = get_encoder(n_features=n_features, output_dim=encoder_dim)
+        # Read actual encoder output dim safely
         encoder_dim = getattr(self.encoder, 'output_dim', encoder_dim)
 
         # Trainable projector
@@ -231,29 +232,26 @@ class RingGemmaModel(nn.Module):
         wrapper = _GemmaWrapper(model)
         return wrapper, tokenizer
 
-    def forward(self, ppg_segments: torch.Tensor, ehr_text: list[str],
+    def forward(self, health_ts: torch.Tensor, ehr_text: list[str],
                 labels: torch.Tensor | None = None):
         """Forward pass.
 
         Args:
-            ppg_segments: (batch, N_segments, 1, 1250) PPG windows.
+            health_ts: (batch, T, F) tabular health time-series.
             ehr_text: list of EHR text strings (length = batch).
             labels: (batch,) integer labels, optional.
 
         Returns:
             dict with 'logits' and optionally 'loss'.
         """
-        batch_size = ppg_segments.size(0)
-        n_seg = ppg_segments.size(1)
-        device = ppg_segments.device
+        batch_size = health_ts.size(0)
+        device = health_ts.device
 
-        # 1. Encode PPG segments
-        flat = ppg_segments.view(batch_size * n_seg, 1, -1)  # (B*N, 1, 1250)
+        # 1. Encode health time-series → per-step embeddings
         with torch.no_grad():
-            enc = self.encoder(flat)  # (B*N, 512)
-        enc = enc.view(batch_size, n_seg, -1)  # (B, N, 512)
+            enc = self.encoder(health_ts)  # (B, T, encoder_dim)
 
-        # 2. Project to LLM token space
+        # 2. Project to LLM token space (projector pools T → n_tokens)
         sensor_tokens = self.projector(enc)  # (B, n_tokens, llm_dim)
 
         # 3. Tokenize EHR text

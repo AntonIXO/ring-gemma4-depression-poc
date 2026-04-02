@@ -26,11 +26,11 @@ def run_evaluation(model, loader, device):
     all_probs = []
 
     for batch in loader:
-        ppg = batch["ppg_segments"].to(device)
+        ts = batch["health_ts"].to(device)
         texts = batch["ehr_text"]
         labels = batch["label"]
 
-        out = model(ppg, texts)
+        out = model(ts, texts)
         logits = out["logits"].cpu()
         probs = torch.softmax(logits, dim=-1)[:, 1].numpy()
         preds = logits.argmax(dim=-1).numpy()
@@ -87,7 +87,7 @@ Actual ↓
 ## Notes
 
 - This evaluation used **synthetic data** — results are for pipeline validation only.
-- For clinical relevance, train and evaluate on real PPG + EHR datasets (e.g., WESAD, GLOBEM).
+- For clinical relevance, train and evaluate on real wearable + EHR datasets (e.g., WESAD, GLOBEM).
 """
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     with open(output_path, "w") as f:
@@ -104,6 +104,8 @@ def main():
     parser.add_argument("--cpu", action="store_true")
     parser.add_argument("--use_real_llm", action="store_true")
     parser.add_argument("--n_samples", type=int, default=100)
+    parser.add_argument("--time_steps", type=int, default=14)
+    parser.add_argument("--num_features", type=int, default=10)
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--output", type=str,
                         default="results/evaluation_report.md")
@@ -115,15 +117,22 @@ def main():
     # Data
     if args.synthetic:
         print(f"Generating synthetic evaluation set ({args.n_samples} samples)...")
-        dataset = DepressionDataset.create_synthetic(args.n_samples)
+        dataset = DepressionDataset.create_synthetic(
+            args.n_samples,
+            time_steps=args.time_steps,
+            n_features=args.num_features,
+        )
+        n_features = args.num_features
     else:
         raise NotImplementedError("Real data loading not implemented. Use --synthetic.")
+        n_features = 10  # unreachable, for type checker
 
     loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False,
                         collate_fn=collate_fn)
 
     # Model
-    model = RingGemmaModel(use_real_llm=args.use_real_llm, device=device)
+    model = RingGemmaModel(n_features=n_features,
+                           use_real_llm=args.use_real_llm, device=device)
     model = model.to(device)
 
     # Load checkpoint if it exists
