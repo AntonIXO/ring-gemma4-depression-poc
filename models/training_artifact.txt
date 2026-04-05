@@ -1,0 +1,7 @@
+fused_dim=64
+moment_dim=15
+day_dim=20
+week_dim=40
+lora_weights_dim=128
+cohort_ok=true
+pad_sub_tokens=1,2,5,5,3

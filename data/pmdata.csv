@@ -1,0 +1,5 @@
+participant_id,timestamp_s,heart_rate,steps,temperature
+p001,1710201600,71,14,36.6
+p001,1710201900,73,11,36.7
+p002,1710201600,66,7,36.3
+

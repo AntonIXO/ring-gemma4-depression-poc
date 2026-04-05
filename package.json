@@ -1,0 +1,21 @@
+{
+  "name": "cognitive-state-system",
+  "version": "2.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start:pipeline": "node dist/cli/pipeline.js",
+    "start:train": "node dist/cli/train.js",
+    "start:search": "node dist/cli/search.js",
+    "smoke": "npm run build && npm run start:pipeline && npm run start:train && npm run start:search"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.50.2"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.2"
+  }
+}
+

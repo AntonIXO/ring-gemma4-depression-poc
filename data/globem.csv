@@ -1,0 +1,5 @@
+participant_id,timestamp_s,heart_rate,eda,skin_temp
+p001,1710201600,72,0.14,36.5
+p001,1710201900,73,0.16,36.6
+p002,1710201600,67,0.11,36.3
+
